@@ -3,6 +3,7 @@
 package udp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -11,6 +12,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	proxyproto "github.com/pires/go-proxyproto"
 
 	"github.com/chihaya/chihaya/bittorrent"
 	"github.com/chihaya/chihaya/frontend"
@@ -97,7 +100,7 @@ func (cfg Config) Validate() Config {
 
 // Frontend holds the state of a UDP BitTorrent Frontend.
 type Frontend struct {
-	socket  *net.UDPConn
+	conn    *net.UDPConn
 	closing chan struct{}
 	wg      sync.WaitGroup
 
@@ -123,10 +126,11 @@ func NewFrontend(logic frontend.TrackerLogic, provided Config) (*Frontend, error
 		},
 	}
 
-	err := f.listen()
+	conn, err := net.ListenPacket("udp", f.Addr)
 	if err != nil {
 		return nil, err
 	}
+	f.conn = conn.(*net.UDPConn)
 
 	go func() {
 		if err := f.serve(); err != nil {
@@ -148,22 +152,12 @@ func (t *Frontend) Stop() stop.Result {
 	c := make(stop.Channel)
 	go func() {
 		close(t.closing)
-		t.socket.SetReadDeadline(time.Now())
+		t.conn.SetReadDeadline(time.Now())
 		t.wg.Wait()
-		c.Done(t.socket.Close())
+		c.Done(t.conn.Close())
 	}()
 
 	return c.Result()
-}
-
-// listen resolves the address and binds the server socket.
-func (t *Frontend) listen() error {
-	udpAddr, err := net.ResolveUDPAddr("udp", t.Addr)
-	if err != nil {
-		return err
-	}
-	t.socket, err = net.ListenUDP("udp", udpAddr)
-	return err
 }
 
 // serve blocks while listening and serving UDP BitTorrent requests
@@ -185,7 +179,7 @@ func (t *Frontend) serve() error {
 
 		// Read a UDP packet into a reusable buffer.
 		buffer := pool.Get()
-		n, addr, err := t.socket.ReadFromUDP(buffer)
+		n, addr, err := t.conn.ReadFromUDP(buffer)
 		if err != nil {
 			pool.Put(buffer)
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
@@ -201,13 +195,31 @@ func (t *Frontend) serve() error {
 			continue
 		}
 
+		b := bufio.NewReader(bytes.NewReader(buffer[:n]))
+		h, err := proxyproto.Read(b)
+		if err != nil {
+			pool.Put(buffer)
+			continue
+		}
+		raddr, ok := h.SourceAddr.(*net.TCPAddr)
+		if !ok {
+			pool.Put(buffer)
+			continue
+		}
+
+		n, err = b.Read(buffer)
+		if err != nil {
+			pool.Put(buffer)
+			continue
+		}
+
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
 			defer pool.Put(buffer)
 
-			if ip := addr.IP.To4(); ip != nil {
-				addr.IP = ip
+			if ip := raddr.IP.To4(); ip != nil {
+				raddr.IP = ip
 			}
 
 			// Handle the request.
@@ -217,8 +229,8 @@ func (t *Frontend) serve() error {
 			}
 			action, af, err := t.handleRequest(
 				// Make sure the IP is copied, not referenced.
-				Request{buffer[:n], append([]byte{}, addr.IP...)},
-				ResponseWriter{t.socket, addr},
+				Request{buffer[:n], append([]byte{}, raddr.IP...)},
+				ResponseWriter{t.conn, addr},
 			)
 			if t.EnableRequestTiming {
 				recordResponseDuration(action, af, err, time.Since(start))
@@ -238,13 +250,13 @@ type Request struct {
 // ResponseWriter implements the ability to respond to a Request via the
 // io.Writer interface.
 type ResponseWriter struct {
-	socket *net.UDPConn
-	addr   *net.UDPAddr
+	conn *net.UDPConn
+	addr *net.UDPAddr
 }
 
 // Write implements the io.Writer interface for a ResponseWriter.
 func (w ResponseWriter) Write(b []byte) (int, error) {
-	w.socket.WriteToUDP(b, w.addr)
+	w.conn.WriteToUDP(b, w.addr)
 	return len(b), nil
 }
 
